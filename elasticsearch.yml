@@ -1,0 +1,22 @@
+# author flowpoint
+# i am a beginner at elasticsearch, some settings might be bad
+
+cluster.name: "docker-cluster"
+network.host: 0.0.0.0
+
+indices.queries.cache.size: 2%
+#indices.queries.cache.enabled: true
+
+
+slm.history_index_enabled: false
+xpack.watcher.enabled: false
+
+# for text analysis try the standard analyzer first (grammar based),
+# should be ok for english
+#
+#
+#
+#
+#stack.templates.enabled: false
+#index.default_pipeline: "ingest_pipeline"
+#
