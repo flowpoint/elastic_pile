@@ -5,7 +5,7 @@ currently this is just a hacked together way to load the pile dataset into elast
 
 on a 12 core and nvme ssd, the ~450 MB val.json file took 3.5 minutes.
 the index was around 1.3 gb for the file.
-extrapolated to the pile (naively extrapolated 30 files at 15GB each => 30*30*3.5 => 53h)
+extrapolated to the pile (naively extrapolated 30 files at 15GB each => 30 * 30 * 3.5 => 53h)
 
 ### to push pile data into elasticsearch:
 
