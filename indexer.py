@@ -22,7 +22,7 @@ from tokenizers import normalizers
 mode = "index"
 
 # the order of files is important, because we enumerate the id across files
-filelist = sorted(["../val.jsonl.zst"])
+filelist = sorted(["pile/val.jsonl.zst"])
 #filelist = sorted(["../00.jsonl.zst"])
 
 for f in filelist:
