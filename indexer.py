@@ -1,21 +1,18 @@
 #!/bin/python
-
-from lm_dataformat import Reader
-from tqdm import tqdm
+import os
+import json
 from itertools import accumulate, chain, starmap
 from functools import reduce
-from elasticsearch import Elasticsearch
-from elasticsearch.helpers import bulk, streaming_bulk, parallel_bulk
 from multiprocessing import pool, Pool, Queue
-import json
-import os
+from typing import List
 
 from more_itertools import chunked
+from tqdm import tqdm # type: ignore
 
-from tokenizers import pre_tokenizers
-from tokenizers import decoders
-from tokenizers import normalizers
-
+from elasticsearch import Elasticsearch
+from elasticsearch.helpers import bulk, streaming_bulk, parallel_bulk
+from tokenizers import pre_tokenizers, decoders, normalizers # type: ignore
+from lm_dataformat import Reader # type: ignore
 
 #mode = "dryrun"
 #mode = "client"
@@ -27,7 +24,7 @@ filelist = sorted(["pile/val.jsonl.zst"])
 
 for f in filelist:
     if not os.path.isfile(f):
-        raise Exception("the file: {f} doesn't exist")
+        raise FileNotFoundError(f)
 
 
 index_name = "test_index"
@@ -51,6 +48,8 @@ if pretokenizer_type == "whitespace":
     pretok = pre_tokenizers.ByteLevel()
     decoder = decoders.ByteLevel()
     decode_fn = decoder.decode
+else:
+    raise ValueError("pretokenizer: {pretokenizer_type} is not supported")
 
 
 # we need to normalize or the pretokenizer gets unexpected characters
@@ -58,7 +57,7 @@ if pretokenizer_type == "whitespace":
 normalizer = normalizers.NFC()
 
 
-def chunk_document(numbered_document)-> [[str]]:
+def chunk_document(numbered_document) -> List[List[str]]:
     filelocal_document_number, document = numbered_document
 
     try:
@@ -70,7 +69,7 @@ def chunk_document(numbered_document)-> [[str]]:
     return chunks
 
 
-def fileloader(filename: str) -> [str]:
+def fileloader(filename: str) -> List[str]:
     rdr = Reader(filename)
 
     batch = []
@@ -118,7 +117,7 @@ def create_index(client: Elasticsearch, index_name: str):
             }
     }'''
 
-def search_phrase(entityA: str, entityB: str, num_results=10, max_slop=100):
+def search_phrase(entityA: str, entityB: str, num_results: int = 10, max_slop: int = 100):
     query = {
             "size": num_results,
             "query": {
@@ -196,3 +195,5 @@ elif mode == "index":
     except Exception as e:
         error = e
         print(e)
+else:
+    raise ValueError("mode: {mode} is not supported")

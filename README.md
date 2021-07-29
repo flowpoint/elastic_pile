@@ -31,6 +31,13 @@ run `./start` to start the elastic docker container
 
 run `python indexer.py`
 
+### tips
+
+show the logs:
+```
+docker logs 
+```
+
 ### other
 todo:
 
