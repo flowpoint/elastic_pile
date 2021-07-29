@@ -38,6 +38,16 @@ show the logs:
 docker logs 
 ```
 
+run the unittests:
+```
+python -m unittest indexerTest
+```
+
+run mypy:
+```
+mypy indexer.py
+```
+
 ### other
 todo:
 
