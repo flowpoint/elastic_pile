@@ -6,13 +6,16 @@ from functools import reduce
 from multiprocessing import pool, Pool, Queue
 from typing import List, Tuple, Dict, Generator, Iterator
 
-from more_itertools import chunked
+from more_itertools import chunked, flatten
 from tqdm import tqdm # type: ignore
 
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import bulk, streaming_bulk, parallel_bulk
 from tokenizers import pre_tokenizers, decoders, normalizers # type: ignore
 from lm_dataformat import Reader # type: ignore
+
+import cProfile, pstats, io
+from pstats import SortKey
 
 #mode = "dryrun"
 #mode = "client"
@@ -73,9 +76,7 @@ class Chunker:
         return self.decoder.decode(x)
 
 
-    def chunk_document(self, numbered_document: tuple[int, str]) -> list[str]:
-        filelocal_document_number, document = numbered_document
-
+    def chunk_document(self, document: tuple[int, str]) -> list[str]:
         try:
             parts = self._encode(self._norm(document))
         except Exception as e:
@@ -89,30 +90,6 @@ class Chunker:
 
         return chunks
 
-
-def fileloader(filename: str) -> Iterator[str]:
-    rdr = Reader(filename)
-
-    batch = []
-    chunker = Chunker(pretokenizer_type)
-
-    with Pool(processes=thread_count) as pool:
-        for filelocal_document_number, document in enumerate(rdr.stream_data()):
-            # track document number/order through parallel execution
-            batch.append((filelocal_document_number, document))
-
-            if filelocal_document_number % batch_size == 0:
-                if use_mp:
-                    chunk_batch = pool.map(chunker.chunk_document, batch)
-                else:
-                    chunk_batch = list(map(chunker.chunk_document, batch))
-
-                batch = []
-
-                for chunks in chunk_batch:
-                    for chunk in chunks:
-                        assert isinstance(chunk, str), "chunk in fileloader has to be a str"
-                        yield chunk
 
 
 def create_index(client: Elasticsearch, index_name: str):
@@ -174,6 +151,17 @@ def print_hits(res):
         print(f'{hit["_source"]}')
 
 
+def action_loader(dataloader):
+    # because we chain all files, we use
+    for id, chunk in dataloader:
+        assert isinstance(chunk, str), "chunk has to be a str"
+        yield create_action(chunk, id, index_name)
+
+
+def lm_reader(filename: str):
+    rdr = Reader(filename)
+    return rdr.stream_data()
+
 
 def create_action(src: str, id: int, index_name: str):
     return { "_op_type": "create",
@@ -183,41 +171,46 @@ def create_action(src: str, id: int, index_name: str):
              "_source": {"text": src},
            }
 
-def action_loader(dataloader):
-    # because we chain all files, we use
-    for id, chunk in enumerate(dataloader):
-        assert isinstance(chunk, str), "chunk has to be a str"
-        yield create_action(chunk, id, index_name)
-
-
-
-
 if __name__ == '__main__':
     es = Elasticsearch()
 
     #es.indices.delete(index=index_name)#, ignore=[400, 404])
-    create_index(es, index_name)
+    if not es.indices.exists(index_name):
+        create_index(es, index_name)
+    #create_index(es, index_name)
 
-    # chain iterators for all files
-    dataloader = chain(*[fileloader(fn) for fn in filelist])
+    # chains all file readers
+    dataiter = chain(*[lm_reader(fn) for fn in filelist])
 
-    if mode == "dryrun":
-        for chunk in tqdm(dataloader, unit="chunk"):
+    chunker = Chunker(pretokenizer_type)
+
+    with Pool(processes=thread_count) as pool:
+        if use_mp:
+            chunklist = pool.imap_unordered(chunker.chunk_document, dataiter)
+            processed = action_loader(enumerate(flatten(chunklist)))
+
+
+        else:
+            chunklist = map(chunker.chunk_document, dataiter)
+            processed = action_loader(enumerate(flatten(chunklist)))
+
+
+        if mode == "dryrun":
+            for action in tqdm(processed):
+                pass
+        elif mode == "client":
             pass
 
-    elif mode == "client":
-        pass
+        elif mode == "index":
+            try:
+                for ok, info in tqdm(streaming_bulk(es, processed), unit="chunk"):
+                    if not ok:
+                        raise Exception(info)
+                        break
+            except Exception as e:
+                error = e
+                print(e)
+        else:
+            raise ValueError("mode: {mode} is not supported")
 
-    elif mode == "index":
-        # save error to var for interactive debug
-        error = None
-        try:
-            for ok, info in tqdm(streaming_bulk(es, action_loader(dataloader)), unit="chunk"):
-                if not ok:
-                    raise Exception(info)
-                    break
-        except Exception as e:
-            error = e
-            print(e)
-    else:
-        raise ValueError("mode: {mode} is not supported")
+
