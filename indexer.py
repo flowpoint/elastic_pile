@@ -3,7 +3,7 @@ import os
 import json
 from itertools import accumulate, chain, starmap
 from functools import reduce
-from multiprocessing import pool, Pool, Queue
+import multiprocessing as mp
 from typing import List, Tuple, Dict, Generator, Iterator
 
 from more_itertools import chunked
@@ -20,6 +20,7 @@ mode = "index"
 
 # the order of files is important, because we enumerate the id across files
 filelist = sorted(["pile/val.jsonl.zst"])
+#filelist = sorted(["tmp/testdata.jsonl.zst"])
 #filelist = sorted(["../00.jsonl.zst"])
 
 for f in filelist:
@@ -79,40 +80,84 @@ class Chunker:
         try:
             parts = self._encode(self._norm(document))
         except Exception as e:
-            print(e)
+            print(e[:100])
+
             exit(-1)
 
         try:
             chunks = list(map(self._decode, chunked(parts, chunksize)))
         except Exception as e:
-            print(e)
+            print(e[:100])
 
-        return chunks
+        return filelocal_document_number, chunks
+
+
+def worker(qin, qout, chunker):
+    while 1:
+        inp = qin.get(block=True)
+        # -1 signals to stop
+        if inp == -1:
+            break
+
+        k, chunked = chunker.chunk_document(inp)
+        qout.put((k, chunked), block=True)
+
+    qout.put("OK", block=True)
 
 
 def fileloader(filename: str) -> Iterator[str]:
     rdr = Reader(filename)
+    qsize = 10000
+    qin = mp.Queue(qsize)
+    qout = mp.Queue(qsize)
+    #mp.set_start_method("spawn")
 
-    batch = []
-    chunker = Chunker(pretokenizer_type)
+    procs = []
+    for _ in range(thread_count):
+        chunker = Chunker(pretokenizer_type)
+        proc = mp.Process(target=worker, args=(qin, qout, chunker))
+        procs.append(proc)
 
-    with Pool(processes=thread_count) as pool:
-        for filelocal_document_number, document in enumerate(rdr.stream_data()):
-            # track document number/order through parallel execution
-            batch.append((filelocal_document_number, document))
+    for p in procs:
+        p.start()
 
-            if filelocal_document_number % batch_size == 0:
-                if use_mp:
-                    chunk_batch = pool.map(chunker.chunk_document, batch)
-                else:
-                    chunk_batch = list(map(chunker.chunk_document, batch))
+    to_be_processed = 0
 
-                batch = []
+    for filelocal_document_number, document in enumerate(rdr.stream_data()):
+        #print(f"document has type: {type(document)}")
+        to_be_processed += 1
+        qin.put((filelocal_document_number, document), block=True)
 
-                for chunks in chunk_batch:
-                    for chunk in chunks:
-                        assert isinstance(chunk, str), "chunk in fileloader has to be a str"
-                        yield chunk
+        if qin.full() is True:
+            k, chunked = qout.get(block=True)
+            to_be_processed -= 1
+            #yield k, chunked
+            for c in chunked:
+                yield c
+
+    while to_be_processed > 0:
+        k, chunked = qout.get(block=True)
+        to_be_processed -= 1
+        #yield k, chunked
+        for c in chunked:
+            yield c
+
+    for _ in procs:
+        # -1 signals to stop
+        qin.put(-1, block=True)
+        res = qout.get(block=True)
+        if res != "OK":
+            print("process didn't finish correctly")
+
+    qin.close()
+    qout.close()
+
+    for p in procs:
+        p.join()
+        p.close()
+
+    qin.join_thread()
+    qout.join_thread()
 
 
 def create_index(client: Elasticsearch, index_name: str):
@@ -174,7 +219,6 @@ def print_hits(res):
         print(f'{hit["_source"]}')
 
 
-
 def create_action(src: str, id: int, index_name: str):
     return { "_op_type": "create",
              "_index": index_name,
@@ -183,20 +227,26 @@ def create_action(src: str, id: int, index_name: str):
              "_source": {"text": src},
            }
 
+
 def action_loader(dataloader):
     # because we chain all files, we use
-    for id, chunk in enumerate(dataloader):
-        assert isinstance(chunk, str), "chunk has to be a str"
-        yield create_action(chunk, id, index_name)
-
-
+    try:
+        for id, chunk in enumerate(dataloader):
+            #print(type(chunk))
+            assert isinstance(chunk, str), "chunk has to be a str"
+            yield create_action(chunk, id, index_name)
+    except:
+        print("err")
 
 
 if __name__ == '__main__':
     es = Elasticsearch()
 
-    #es.indices.delete(index=index_name)#, ignore=[400, 404])
-    create_index(es, index_name)
+    es.indices.delete(index=index_name)#, ignore=[400, 404])
+    if es.indices.exists(index=index_name):
+        print(f"using existing index {index_name}")
+    else:
+        create_index(es, index_name)
 
     # chain iterators for all files
     dataloader = chain(*[fileloader(fn) for fn in filelist])
@@ -218,6 +268,6 @@ if __name__ == '__main__':
                     break
         except Exception as e:
             error = e
-            print(e)
+            #print(e[:100])
     else:
         raise ValueError("mode: {mode} is not supported")
