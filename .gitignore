@@ -2,4 +2,5 @@ pile/*
 data/*
 Pipfile.lock
 tmp/*
+logs/*
 !tmp/testdata.jsonl.zst

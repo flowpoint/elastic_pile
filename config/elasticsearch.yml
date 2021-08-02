@@ -7,9 +7,16 @@ network.host: 0.0.0.0
 indices.queries.cache.size: 2%
 #indices.queries.cache.enabled: true
 
+#
+#index.refresh_interval: 30s
+#index.number_of_replicas: 0
 
 slm.history_index_enabled: false
 xpack.watcher.enabled: false
+
+indices.memory.index_buffer_size: 512MB
+node.roles: [ master, ingest, data_hot, data ]
+
 
 # for text analysis try the standard analyzer first (grammar based),
 # should be ok for english

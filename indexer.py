@@ -1,7 +1,10 @@
 #!/bin/python
 import os
 import json
-from itertools import accumulate, chain, starmap
+import logging
+from time import time
+from datetime import datetime
+from itertools import accumulate, chain, starmap, cycle
 from functools import reduce
 from multiprocessing import pool, Pool, Queue
 from typing import List, Tuple, Dict, Generator, Iterator
@@ -17,9 +20,20 @@ from lm_dataformat import Reader # type: ignore
 import cProfile, pstats, io
 from pstats import SortKey
 
+logfile = f"logs/indexer_{datetime.utcnow().timestamp()}.log"
+if os.path.isfile(logfile):
+    raise RuntimeError("logfile already exists")
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(filename=logfile, level=logging.WARNING)
+
 #mode = "dryrun"
 #mode = "client"
 mode = "index"
+
+host = "localhost"
+
+overwrite_index = True
 
 # the order of files is important, because we enumerate the id across files
 filelist = sorted(["pile/val.jsonl.zst"])
@@ -37,10 +51,12 @@ use_mp = True
 
 # choose the pretokenizer, for splitting to words
 pretokenizer_type = "whitespace"
-thread_count = 24
+thread_count = 8
 
-# how many documents are batched for parallelism
-batch_size = 5000
+skip_chunks = -1
+
+def trunce(e):
+    return str(e)[:1000]
 
 class WhitespaceDecoder:
     def decode(self, x: list[str]) -> str:
@@ -75,21 +91,20 @@ class Chunker:
     def _decode(self, x: list[str]) -> str:
         return self.decoder.decode(x)
 
-
-    def chunk_document(self, document: tuple[int, str]) -> list[str]:
+    def chunk_document(self, document: str) -> list[str]:
         try:
             parts = self._encode(self._norm(document))
+            try:
+                # important that some of these maps are evaluated or they spam your memory
+                chunks = list(map(self._decode, chunked(parts, chunksize)))
+                return chunks
+            except Exception as e:
+                logger.error("chunker encoding failed with:\n{trunce(e)}")
+            return [""]
+
         except Exception as e:
-            print(e)
-            exit(-1)
-
-        try:
-            chunks = list(map(self._decode, chunked(parts, chunksize)))
-        except Exception as e:
-            print(e)
-
-        return chunks
-
+            logger.error("chunker decoding failed with:\n{trunce(e)}")
+        return [""]
 
 
 def create_index(client: Elasticsearch, index_name: str):
@@ -97,16 +112,21 @@ def create_index(client: Elasticsearch, index_name: str):
     client.indices.create(
         index=index_name,
         body={
-            "settings": {},
+            "settings": {
+                "refresh_interval": "30s",
+                "number_of_replicas": 1,
+                },
             "mappings": {
                 "properties": {
                     "text": {
                         "type": "text",
+                        "norms": False,
                         "similarity": "boolean",
                         "index_options": "positions",
                     },
                 }
             },
+
         },
         #ignore=400,
     )
@@ -151,66 +171,83 @@ def print_hits(res):
         print(f'{hit["_source"]}')
 
 
-def action_loader(dataloader):
-    # because we chain all files, we use
-    for id, chunk in dataloader:
-        assert isinstance(chunk, str), "chunk has to be a str"
-        yield create_action(chunk, id, index_name)
-
-
-def lm_reader(filename: str):
+def lm_reader(filename: str) -> tuple[str, int, str]:
     rdr = Reader(filename)
     return rdr.stream_data()
 
 
-def create_action(src: str, id: int, index_name: str):
+def action_loader(dataloader):
+    # because we chain all files, we use
+    for total_pos, chunk in dataloader:
+        if total_pos < skip_chunks:
+            continue
+        if chunk is "":
+            continue
+        if chunk == [""]:
+            continue
+
+
+        assert isinstance(chunk, str), "chunk has to be a str"
+        yield create_action(chunk, total_pos, index_name)
+
+
+def create_action(src: str, total_pos: int, index_name: str):
     return { "_op_type": "create",
              "_index": index_name,
-             "_id": id,
-#            "_type": "document",
-             "_source": {"text": src},
+             "_id": total_pos,
+#            "_type": "text",
+             #"_source": {"text": src},
+             "text": src,
            }
 
 if __name__ == '__main__':
-    es = Elasticsearch()
+    es = Elasticsearch([host])
 
-    #es.indices.delete(index=index_name)#, ignore=[400, 404])
-    if not es.indices.exists(index_name):
+    if overwrite_index:
+        es.indices.delete(index=index_name, ignore=[400, 404])
+
+    if not es.indices.exists(index=index_name):
         create_index(es, index_name)
-    #create_index(es, index_name)
 
     # chains all file readers
     dataiter = chain(*[lm_reader(fn) for fn in filelist])
 
     chunker = Chunker(pretokenizer_type)
 
+    starttime = time()
+    lastlog = starttime - 1
+
     with Pool(processes=thread_count) as pool:
         if use_mp:
             chunklist = pool.imap_unordered(chunker.chunk_document, dataiter)
             processed = action_loader(enumerate(flatten(chunklist)))
 
-
         else:
             chunklist = map(chunker.chunk_document, dataiter)
             processed = action_loader(enumerate(flatten(chunklist)))
 
-
         if mode == "dryrun":
-            for action in tqdm(processed):
+            for _ in tqdm(processed):
                 pass
         elif mode == "client":
+            # search_phrase
             pass
 
         elif mode == "index":
             try:
+                i = 0
                 for ok, info in tqdm(streaming_bulk(es, processed), unit="chunk"):
+                    i += 1
+                    if time() - lastlog > 60:
+                        logger.info(f"processed {i} documents")
+                        lastlog = time()
+
                     if not ok:
                         raise Exception(info)
                         break
             except Exception as e:
-                error = e
-                print(e)
+                logger.error(f"error in streaming_bulk:\n{trunce(e)}")
         else:
-            raise ValueError("mode: {mode} is not supported")
+            raise ValueError(f"mode: {mode} is not supported")
 
 
