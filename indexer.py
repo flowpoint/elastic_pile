@@ -8,6 +8,7 @@ from itertools import accumulate, chain, starmap, cycle
 from functools import reduce
 from multiprocessing import pool, Pool, Queue
 from typing import List, Tuple, Dict, Generator, Iterator
+import subprocess
 
 from more_itertools import chunked, flatten
 from tqdm import tqdm # type: ignore
@@ -15,7 +16,9 @@ from tqdm import tqdm # type: ignore
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import bulk, streaming_bulk, parallel_bulk
 from tokenizers import pre_tokenizers, decoders, normalizers # type: ignore
+import jsonlines
 from lm_dataformat import Reader # type: ignore
+
 
 import cProfile, pstats, io
 from pstats import SortKey
@@ -32,12 +35,14 @@ logging.basicConfig(filename=logfile, level=logging.WARNING)
 mode = "index"
 
 host = "localhost"
+tmpdir = "tmp"
 
-overwrite_index = True
+overwrite_index = False
+run_compressed = False
 
 # the order of files is important, because we enumerate the id across files
-filelist = sorted(["pile/val.jsonl.zst"])
-#filelist = sorted(["../00.jsonl.zst"])
+#filelist = sorted(["pile/val.jsonl.zst"])
+filelist = sorted(["../00.jsonl.zst"])
 
 for f in filelist:
     if not os.path.isfile(f):
@@ -93,7 +98,11 @@ class Chunker:
 
     def chunk_document(self, document: str) -> list[str]:
         try:
-            parts = self._encode(self._norm(document))
+            if isinstance(document, dict):
+                parts = self._encode(self._norm(document["text"]))
+            else:
+                parts = self._encode(self._norm(document))
+
             try:
                 # important that some of these maps are evaluated or they spam your memory
                 chunks = list(map(self._decode, chunked(parts, chunksize)))
@@ -171,9 +180,6 @@ def print_hits(res):
         print(f'{hit["_source"]}')
 
 
-def lm_reader(filename: str) -> tuple[str, int, str]:
-    rdr = Reader(filename)
-    return rdr.stream_data()
 
 
 def action_loader(dataloader):
@@ -192,6 +198,8 @@ def action_loader(dataloader):
 
 
 def create_action(src: str, total_pos: int, index_name: str):
+    print(src)
+    print("---------")
     return { "_op_type": "create",
              "_index": index_name,
              "_id": total_pos,
@@ -200,18 +208,7 @@ def create_action(src: str, total_pos: int, index_name: str):
              "text": src,
            }
 
-if __name__ == '__main__':
-    es = Elasticsearch([host])
-
-    if overwrite_index:
-        es.indices.delete(index=index_name, ignore=[400, 404])
-
-    if not es.indices.exists(index=index_name):
-        create_index(es, index_name)
-
-    # chains all file readers
-    dataiter = chain(*[lm_reader(fn) for fn in filelist])
-
+def load_file(reader):
     chunker = Chunker(pretokenizer_type)
 
     starttime = time()
@@ -219,11 +216,11 @@ if __name__ == '__main__':
 
     with Pool(processes=thread_count) as pool:
         if use_mp:
-            chunklist = pool.imap_unordered(chunker.chunk_document, dataiter)
+            chunklist = pool.imap_unordered(chunker.chunk_document, reader)
             processed = action_loader(enumerate(flatten(chunklist)))
 
         else:
-            chunklist = map(chunker.chunk_document, dataiter)
+            chunklist = map(chunker.chunk_document, reader)
             processed = action_loader(enumerate(flatten(chunklist)))
 
         if mode == "dryrun":
@@ -251,3 +248,36 @@ if __name__ == '__main__':
             raise ValueError(f"mode: {mode} is not supported")
 
 
+def strip_fileext(filepath, ext):
+    return filepath[::-1].replace(ext[::-1], "", 1)[::-1]
+
+
+if __name__ == '__main__':
+    if mode != "dryrun":
+        es = Elasticsearch([host])
+
+        if overwrite_index:
+            es.indices.delete(index=index_name, ignore=[400, 404])
+
+        if not es.indices.exists(index=index_name):
+            create_index(es, index_name)
+
+    for filepath in filelist:
+        _, filename = os.path.split(filepath)
+
+        #logger.info(f"processed {i} documents")
+        if run_compressed:
+            rdr = Reader(filepath)
+            load_file(rdr.stream_data())
+        else:
+            decompressed_filename = strip_fileext(filename, ".zst")
+            decompressed_path = os.path.join(tmpdir, decompressed_filename)
+            print(f"filename {filename}, {filepath}, {decompressed_filename}, {decompressed_path}")
+            if not os.path.isfile(decompressed_path):
+                print("decompressing: {filepath}")
+                subprocess.run(["zstd", "-d", filepath, "-o", decompressed_path])
+            else:
+                print("found and use decompressed file: {decompressed_path}")
+
+            with jsonlines.open(decompressed_path) as reader:
+                load_file(reader.iter())
