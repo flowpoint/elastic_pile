@@ -27,14 +27,12 @@ def truncate_error(e):
     return str(e)[:1000]
 
 class WhitespaceSplitter:
-    def pretokenize_str(self, x: str) -> list[tuple(str, int)]:
-        splits =  x.split()
+    def pre_tokenize_str(self, x: str) -> list[tuple[str, int]]:
+        splits = x.split()
         # if the splits are suspiciously small, it wasn't split well, 
         # 16 characters per word is suspicious, 8 char is avg for english
         # use character based chunking instead of word based
         if len(splits) * 16 < len(x):
-            print(len(splits))
-            print(len(x))
             res = sliced(x, 8)
         else:
             res = splits
@@ -89,12 +87,14 @@ class Chunker:
                 chunks = list(map(self._decode, chunked(parts, self.chunksize)))
                 return chunks
             except Exception as e:
-                logger.error("chunker encoding failed with:\n{truncate_error(e)}")
+                logger.error(f"chunker encoding failed with:\n{truncate_error(e)}")
             return [""]
 
         except Exception as e:
-            logger.error("chunker decoding failed with:\n{truncate_error(e)}")
+            logger.error(f"chunker decoding failed with:\n{truncate_error(e)}")
         return [""]
+
+
 
 
 def create_index(client: Elasticsearch, index_name: str):
@@ -107,11 +107,12 @@ def create_index(client: Elasticsearch, index_name: str):
                 "number_of_replicas": 1,
                 },
             "mappings": {
+                "dynamic": False,
                 "properties": {
                     "text": {
                         "type": "text",
                         "norms": False,
-                        "similarity": "boolean",
+                        "similarity": "BM25",
                         "index_options": "positions",
                     },
                 }
@@ -127,7 +128,7 @@ def create_index(client: Elasticsearch, index_name: str):
             }
     }'''
 
-def search_phrase(entityA: str, entityB: str, num_results: int = 10, max_slop: int = 100):
+def search_phrase(entityA: str, entityB: str, num_results: int = 10, max_slop: int = 18):
     query = {
             "size": num_results,
             "query": {
@@ -155,10 +156,12 @@ def search_phrase(entityA: str, entityB: str, num_results: int = 10, max_slop: i
 
     return res
 
+
 def print_hits(res):
     print("Got %d Hits:" % res['hits']['total']['value'])
     for hit in res['hits']['hits']:
         print(f'{hit["_source"]}')
+
 
 def create_action(src: str, total_pos: int, index_name: str):
     return { "_op_type": "create",
@@ -168,11 +171,12 @@ def create_action(src: str, total_pos: int, index_name: str):
              "text": src,
            }
 
+
 def action_loader(dataloader):
     for total_pos, chunk in dataloader:
         if total_pos < skip_chunks:
             continue
-        if chunk is "":
+        if chunk == "":
             continue
         if chunk == [""]:
             continue
@@ -180,7 +184,6 @@ def action_loader(dataloader):
         if not isinstance(chunk, str):
             raise ValueError(f"chunk has to be a string but was: {type(chunk)}")
         yield create_action(chunk, total_pos, index_name)
-
 
 
 def load_file(reader, mode, chunksize, paralellism):
@@ -209,14 +212,17 @@ def load_file(reader, mode, chunksize, paralellism):
             try:
                 i = 0
                 for ok, info in tqdm(streaming_bulk(es, processed, chunk_size=bulk_request_size), unit="chunk"):
-                    i += 1
-                    if time() - lastlog > 60:
-                        logger.info(f"processed {i} documents")
-                        lastlog = time()
+                    try:
+                        i += 1
+                        if time() - lastlog > 60:
+                            logger.info(f"processed {i} documents")
+                            lastlog = time()
 
-                    if not ok:
-                        raise Exception(info)
-                        break
+                        if not ok:
+                            raise Exception(info)
+
+                    except Exception as e:
+                        logger.error(f"error in streaming_bulk:\n{truncate_error(e)}")
             except Exception as e:
                 logger.error(f"error in streaming_bulk:\n{truncate_error(e)}")
         else:
@@ -245,20 +251,20 @@ if __name__ == '__main__':
     # configurables
 
     #mode = "dryrun"
-    #mode = "client"
-    mode = "index"
+    mode = "client"
+    #mode = "index"
 
-    bulk_request_size = 500
+    bulk_request_size = 5000
 
     hosts = ["localhost"]
     tmpdir = "tmp"
 
-    overwrite_index = False
+    overwrite_index = True
     run_compressed = False
 
     # the order of files is important, because we enumerate the id across files
-    #filelist = sorted(["pile/val.jsonl.zst"])
-    filelist = sorted(["../00.jsonl.zst"])
+    filelist = sorted(["pile/val.jsonl.zst"])
+    #filelist = sorted(["../00.jsonl.zst"])
 
     for f in filelist:
         if not os.path.isfile(f):
@@ -268,9 +274,8 @@ if __name__ == '__main__':
 
     # size in words according to pre_tokenizer
     chunksize = 256
-    use_mp = False
     # -1 for singlecore n >= 1 for using n parallelism
-    paralellism = -1
+    paralellism = 24
     assert paralellism == -1 or paralellism > 0
 
     # choose the pretokenizer, for splitting to words
@@ -298,7 +303,7 @@ if __name__ == '__main__':
         if run_compressed:
             logger.info(f"running on compressed data")
             rdr = Reader(filepath)
-            load_file(rdr.stream_data(), mode, chunksize)
+            load_file(rdr.stream_data(), mode, chunksize, paralellism)
         else:
             logger.info(f"running on decompressed data")
             decompressed_filename = strip_fileext(filename, ".zst")
@@ -311,5 +316,5 @@ if __name__ == '__main__':
                 logger.info(f"found and use decompressed file: {decompressed_path}")
 
             with jsonlines.open(decompressed_path) as reader:
-                load_file(reader.iter(), mode, chunksize)
+                load_file(reader.iter(), mode, chunksize, paralellism)
         logger.info(f"finished loading file {filepath}")
