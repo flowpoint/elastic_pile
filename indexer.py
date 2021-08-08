@@ -19,26 +19,43 @@ from tokenizers import pre_tokenizers, decoders, normalizers # type: ignore
 import jsonlines
 from lm_dataformat import Reader # type: ignore
 
-import cProfile, pstats, io
-from pstats import SortKey
-
-
 def truncate_error(e):
     return str(e)[:1000]
 
 class WhitespaceSplitter:
-    def pre_tokenize_str(self, x: str) -> list[tuple[str, int]]:
+    def __init__(self, 
+            sus_document_behaviour="split_to_chunks",
+            expected_word_len=8, 
+            sus_len_factor=2, 
+            chunksize=256,
+            ):
+
+        self.sus_document_behaviour = sus_document_behaviour
+        self.expected_word_len = expected_word_len
+        self.sus_word_len = sus_len_factor * self.expected_word_len
+        self.chunksize = chunksize
+
+
+    def pre_tokenize_str(self, x: str) -> tuple[list[tuple[str, int]], bool]:
+        sus = False
         splits = x.split()
         # if the splits are suspiciously small, it wasn't split well, 
         # 16 characters per word is suspicious, 8 char is avg for english
         # use character based chunking instead of word based
-        if len(splits) * 16 < len(x):
-            res = sliced(x, 8)
+        if len(splits) * self.sus_word_len < len(x):
+            sus = True
+            if self.sus_document_behaviour == "split_to_words":
+                res = sliced(x, self.expected_word_len)
+            elif self.sus_document_behaviour == "drop":
+                res = [""]
+            else:
+                res = sliced(self.chunksize)
         else:
             res = splits
 
         # return -1 as word positions for this pre_tokenizer
-        return list(map(lambda s: (s, -1), res))
+        # and if document is sus
+        return list(map(lambda s: (s, -1), res)), sus
 
 
 class WhitespaceDecoder:
@@ -70,31 +87,34 @@ class Chunker:
 
     def _encode(self, x: str) -> list[str]:
         # pretok also returns positions, so we remove them
-        return list(map(lambda x: x[0], self.pretok.pre_tokenize_str(x)))
+        words, sus = self.pretok.pre_tokenize_str(x)
+        return list(map(lambda x: x[0], words)), sus
 
     def _decode(self, x: list[str]) -> str:
         return self.decoder.decode(x)
 
-    def chunk_document(self, document: str) -> list[str]:
+    def chunk_document(self, numbered_document: str) -> list[str]:
         try:
+            pos, document = numbered_document
             if isinstance(document, dict):
-                parts = self._encode(self._norm(document["text"]))
+                parts, sus = self._encode(self._norm(document["text"]))
             else:
-                parts = self._encode(self._norm(document))
+                parts, sus = self._encode(self._norm(document))
 
             try:
                 # important that some of these maps are evaluated or they spam your memory
+                if sus:
+                    logger.warning(f"document {pos} was badly chunked, alternative chunking was used")
+
                 chunks = list(map(self._decode, chunked(parts, self.chunksize)))
                 return chunks
             except Exception as e:
-                logger.error(f"chunker encoding failed with:\n{truncate_error(e)}")
+                logger.error(f"chunker decoding of document: {pos} failed with:\n{truncate_error(e)}")
             return [""]
 
         except Exception as e:
-            logger.error(f"chunker decoding failed with:\n{truncate_error(e)}")
+            logger.error(f"chunker encoding of document: {pos} failed with:\n{truncate_error(e)}")
         return [""]
-
-
 
 
 def create_index(client: Elasticsearch, index_name: str):
@@ -121,14 +141,8 @@ def create_index(client: Elasticsearch, index_name: str):
         },
         #ignore=400,
     )
-    '''
-    "index": {
-        "highlight": {
-            #"max_analyzed_offset": 10000000
-            }
-    }'''
 
-def search_phrase(entityA: str, entityB: str, num_results: int = 10, max_slop: int = 18):
+def search_phrase(entityA: str, entityB: str, num_results: int = 10, max_slop: int = 20):
     query = {
             "size": num_results,
             "query": {
@@ -162,7 +176,6 @@ def print_hits(res):
     for hit in res['hits']['hits']:
         print(f'{hit["_source"]}')
 
-
 def create_action(src: str, total_pos: int, index_name: str):
     return { "_op_type": "create",
              "_index": index_name,
@@ -192,17 +205,23 @@ def load_file(reader, mode, chunksize, paralellism):
     starttime = time()
     lastlog = starttime - 1
 
+
+    number = 0
+
     with Pool(processes=max(paralellism, 1)) as pool:
         if paralellism > 0:
-            chunklist = pool.imap_unordered(chunker.chunk_document, reader)
+            chunklist = pool.imap_unordered(chunker.chunk_document, enumerate(reader))
             processed = action_loader(enumerate(flatten(chunklist)))
 
+            #processed = action_loader(enumerate(flatten(pool.imap_unordered(chunk_document, reader))))
+
         elif paralellism == -1:
-            chunklist = map(chunker.chunk_document, reader)
+            chunklist = map(chunker.chunk_document, enumerate(reader))
             processed = action_loader(enumerate(flatten(chunklist)))
 
         if mode == "dryrun":
-            for _ in tqdm(processed):
+            for action in tqdm(processed):
+                number += 1
                 pass
         elif mode == "client":
             # search_phrase
@@ -210,10 +229,9 @@ def load_file(reader, mode, chunksize, paralellism):
 
         elif mode == "index":
             try:
-                i = 0
                 for ok, info in tqdm(streaming_bulk(es, processed, chunk_size=bulk_request_size), unit="chunk"):
+                    number += 1
                     try:
-                        i += 1
                         if time() - lastlog > 60:
                             logger.info(f"processed {i} documents")
                             lastlog = time()
@@ -229,6 +247,7 @@ def load_file(reader, mode, chunksize, paralellism):
             raise ValueError(f"mode: {mode} is not supported")
 
 
+
 def strip_fileext(filepath, ext):
     return filepath[::-1].replace(ext[::-1], "", 1)[::-1]
 
@@ -241,17 +260,19 @@ if __name__ == '__main__':
     if os.path.isfile(logfile):
         raise RuntimeError("logfile already exists")
 
+    elasticlogger = logging.getLogger("elasticsearch")
+    elasticlogger.addFilter(ElasticLogFilter())
 
     logging.basicConfig(filename=logfile, level=logging.INFO)
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
-    logger.addFilter(ElasticLogFilter())
 
+    logger.addFilter(ElasticLogFilter())
 
     # configurables
 
-    #mode = "dryrun"
-    mode = "client"
+    mode = "dryrun"
+    #mode = "client"
     #mode = "index"
 
     bulk_request_size = 5000
@@ -259,12 +280,12 @@ if __name__ == '__main__':
     hosts = ["localhost"]
     tmpdir = "tmp"
 
-    overwrite_index = True
+    overwrite_index = False
     run_compressed = False
 
     # the order of files is important, because we enumerate the id across files
-    filelist = sorted(["pile/val.jsonl.zst"])
-    #filelist = sorted(["../00.jsonl.zst"])
+    #filelist = sorted(["pile/val.jsonl.zst"])
+    filelist = sorted(["../00.jsonl.zst"])
 
     for f in filelist:
         if not os.path.isfile(f):
@@ -275,7 +296,7 @@ if __name__ == '__main__':
     # size in words according to pre_tokenizer
     chunksize = 256
     # -1 for singlecore n >= 1 for using n parallelism
-    paralellism = 24
+    paralellism = -1
     assert paralellism == -1 or paralellism > 0
 
     # choose the pretokenizer, for splitting to words

@@ -1,0 +1,2 @@
+curl -X POST "localhost:9200/my-index-000001/_cache/clear?pretty"
+
