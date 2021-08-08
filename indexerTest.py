@@ -16,7 +16,7 @@ def test_example_from_jsonl(input_filename: str, output_filename: str):
     ar = Archive(output_filename)
 
     for k, doc in enumerate(rdr.stream_data()):
-        #print(doc)
+        print(doc)
         ar.add_data({"text":doc})
 
         if k > 100:

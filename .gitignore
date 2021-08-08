@@ -1,5 +1,5 @@
 pile/*
-data/*
+data*/*
 Pipfile.lock
 tmp/*
 logs/*
