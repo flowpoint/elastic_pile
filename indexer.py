@@ -118,7 +118,7 @@ class Ingester:
             filepath,
             chunker,
             dryrun,
-            es,
+            es_helper,
             index_name,
             tmpdir,
             logger,
@@ -130,7 +130,7 @@ class Ingester:
         self.errors = 0
 
         self.index_name = index_name
-        self.es = es
+        self.es = es_helper
 
         self.filepath = filepath
         _, filename = os.path.split(self.filepath)
@@ -200,7 +200,7 @@ class Ingester:
             yield self._create_action(chunk, pos * 100 + self.id_, self.index_name)
 
 
-    def ingest(self):
+    def ingest(self, es_helper):
         starttime = time()
         lastlog = starttime
 
@@ -227,7 +227,7 @@ class Ingester:
                 return
 
             try:
-                for ok, info in tqdm(streaming_bulk(self.es, processed, chunk_size=self.bulk_request_size), unit="chunk"):
+                for ok, info in tqdm(es_helper.streaming_bulk(processed), unit="chunk"):
                     self.chunk_pos += 1
                     try:
                         if time() - lastlog > 60:
@@ -248,252 +248,104 @@ class Ingester:
         self.logger.info(f"finished loading file {self.filepath}, id: {self.id_} with error count: {self.errors}, document count: {self.document_pos} and chunk count: {self.chunk_pos}")
 
 
-class ElasticLogFilter(logging.Filter):
-    def filter(self, record):
-        return not record.name.startswith("elasticsearch")
-
-def create_index(es: Elasticsearch, index_name: str):
-    """Creates an index in Elasticsearch if one isn't already there."""
-    es.indices.create(
-        index=index_name,
-        body={
-            "settings": {
-                "refresh_interval": "30s",
-                "number_of_replicas": 1,
-                },
-            "mappings": {
-                "dynamic": False,
-                "properties": {
-                    "text": {
-                        "type": "text",
-                        "norms": False,
-                        "similarity": "BM25",
-                        "index_options": "positions",
-                    },
-                }
-            },
-
-        },
-        ignore=400,
-    )
-
-def search_phrase(es: Elasticsearch, index_name, entityA: str, entityB: str, num_results: int = 10, max_slop: int = 20):
-    query = {
-            "size": num_results,
-            "query": {
-                "bool": {
-                    "must": {
-                        "match_phrase": {
-                            "text": {
-                                "query": f"{entityA} {entityB}",
-                                "slop": max_slop,
-                                },
-                            },
-                        },
-                    }
-                },
-            "highlight": {
-                "fields": {
-                    "text": {
-                        "type": "unified",
-                        "max_analyzed_offset": 1000000 - 1,
-                        },
-                    },
-                },
-            }
-    res = es.search(index=index_name, body=query)
-
-    return res
-
-
-def print_hits(res):
-    print("Got %d Hits:" % res['hits']['total']['value'])
-    for hit in res['hits']['hits']:
-        print(f'{hit["_source"]}')
-
 def truncate_error(e):
     return str(e)[:1000]
-
-
-if __name__ == '__main__':
-    logfile = f"logs/indexer_{datetime.utcnow().timestamp()}.log"
-    if os.path.isfile(logfile):
-        raise RuntimeError("logfile already exists")
-
-
-    # configurables
-
-    dryrun = False
-    #mode = "client"
-    #mode = "index"
-
-    bulk_request_size = 5000
-
-
-    def _strip_fileext(self, filepath, ext):
-        return filepath[::-1].replace(ext[::-1], "", 1)[::-1]
-
-    def _create_action(self, src: str, id_: int, index_name: str):
-        return { "_op_type": "create",
-                 "_index": index_name,
-                 "_id": id_,
-                 #"_source": {"text": src},
-                 "text": src,
-               }
-
-    def check_health(self):
-        if self.errorlimit < self.errors:
-            self.logger.error(f"too many errors: {self.errors}, quitting")
-            sys.exit(1)
-
-    def _reader(self):
-        if self.run_compressed:
-            self.logger.info(f"running on compressed data")
-            reader = Reader(self.filepath)
-            for doc in reader.stream_data():
-                self.check_health()
-                self.document_pos += 1
-                yield doc
-        else:
-            self.logger.info(f"running on decompressed data")
-            decompressed_filename = self._strip_fileext(filename, ".zst")
-            decompressed_path = os.path.join(self.tmpdir, decompressed_filename)
-
-            if not os.path.isfile(decompressed_path):
-                self.logger.info(f"decompressing: {self.filepath}")
-                subprocess.run(["zstd", "-d", self.filepath, "-o", decompressed_path])
-            else:
-                self.logger.info(f"found and use decompressed file: {decompressed_path}")
-
-            with jsonlines.open(decompressed_path) as reader:
-                for doc in reader.iter():
-                    self.check_health()
-                    yield doc
-
-    def _action_loader(self, chunks):
-        for pos, chunk in enumerate(chunks):
-            if not isinstance(chunk, str):
-                self.errors += 1
-                raise ValueError(f"chunk has to be a string but was: {type(chunk)}")
-            # assume there are maximum 100 Fileloaders/ dataset shards
-            yield self._create_action(chunk, pos * 100 + self.id_, self.index_name)
-
-
-    def ingest(self):
-        starttime = time()
-        lastlog = starttime
-
-        self.logger.info(f"started Fileloader load_file {self.filepath}")
-
-        reader = self._reader()
-
-        with Pool(processes=max(self.paralellism, 1)) as pool:
-            if self.paralellism > 0:
-                chunklist = pool.imap_unordered(self.chunker.chunk_document, reader)
-                processed = self._action_loader(flatten(chunklist))
-
-            elif self.paralellism == -1:
-                chunklist = map(self.chunker.chunk_document, reader)
-                processed = self._action_loader(flatten(chunklist))
-            else:
-                self.errors += 1
-                raise ValueError(f"invalid paralellism: {paralellism}")
-
-            if self.dryrun:
-                for action in tqdm(processed):
-                    self.chunk_pos += 1
-                    pass
-                return
-            else:
-
-                try:
-                    for ok, info in tqdm(streaming_bulk(self.es, processed, chunk_size=self.bulk_request_size), unit="chunk"):
-                        self.chunk_pos += 1
-                        try:
-                            if time() - lastlog > 60:
-                                self.logger.info(f"processed {self.chunk_pos} chunks")
-                                lastlog = time()
-
-                            if not ok:
-                                self.errors += 1
-                                raise Exception(info)
-
-                        except Exception as e:
-                            self.errors += 1
-                            self.logger.error(f"error in streaming_bulk:\n{truncate_error(e)}")
-                except Exception as e:
-                    self.errors+=1
-                    self.logger.error(f"error in streaming_bulk:\n{truncate_error(e)}")
-
-            self.logger.info(f"finished loading file {self.filepath}, id: {self.id_} with error count: {self.errors}, document count: {self.document_pos} and chunk count: {self.chunk_pos}")
 
 
 class ElasticLogFilter(logging.Filter):
     def filter(self, record):
         return not record.name.startswith("elasticsearch")
 
-def create_index(es: Elasticsearch, index_name: str):
-    """Creates an index in Elasticsearch if one isn't already there."""
-    es.indices.create(
-        index=index_name,
-        body={
-            "settings": {
-                "refresh_interval": "30s",
-                "number_of_replicas": 1,
-                },
-            "mappings": {
-                "dynamic": False,
-                "properties": {
-                    "text": {
-                        "type": "text",
-                        "norms": False,
-                        "similarity": "BM25",
-                        "index_options": "positions",
-                    },
-                }
-            },
 
-        },
-        ignore=400,
-    )
+class ElasticHelper:
+    def __init__(
+            self,
+            hosts,
+            index_name,
+            logger,
+            bulk_request_size=1000,
+            overwrite_index=False,
+            timeout=30,
+            ):
 
-def search_phrase(es: Elasticsearch, index_name, entityA: str, entityB: str, num_results: int = 10, max_slop: int = 20):
-    query = {
-            "size": num_results,
-            "query": {
-                "bool": {
-                    "must": {
-                        "match_phrase": {
-                            "text": {
-                                "query": f"{entityA} {entityB}",
-                                "slop": max_slop,
+        self.hosts = hosts
+        self.es = Elasticsearch(self.hosts, timeout=timeout)
+        self.index_name = index_name
+        self.overwrite_index = overwrite_index
+        self.logger = logger
+        self.bulk_request_size = bulk_request_size
+
+        if self.overwrite_index:
+            self.logger.info(f"overwriting old index: {index_name}")
+            self.es.indices.delete(index=index_name, ignore=[400, 404])
+
+        if not self.es.indices.exists(index=index_name):
+            self.logger.info(f"creating new index: {index_name}")
+            self._create_index()
+
+    def streaming_bulk(self, processed):
+        return streaming_bulk(self.es, processed, chunk_size=self.bulk_request_size)
+
+    def refresh(self):
+        self.es.indices.refresh()
+
+    def search_phrase(self, entityA: str, entityB: str, num_results: int = 10, max_slop: int = 20):
+        query = {
+                "size": num_results,
+                "query": {
+                    "bool": {
+                        "must": {
+                            "match_phrase": {
+                                "text": {
+                                    "query": f"{entityA} {entityB}",
+                                    "slop": max_slop,
+                                    },
                                 },
                             },
+                        }
+                    },
+                "highlight": {
+                    "fields": {
+                        "text": {
+                            "type": "unified",
+                            "max_analyzed_offset": 1000000 - 1,
+                            },
+                        },
+                    },
+                }
+        res = self.es.search(index=self.index_name, body=query)
+        return res
+
+    def _create_index(self):
+        self.es.indices.create(
+            index=self.index_name,
+            body={
+                "settings": {
+                    "refresh_interval": "30s",
+                    "number_of_replicas": 1,
+                    },
+                "mappings": {
+                    "dynamic": False,
+                    "properties": {
+                        "text": {
+                            "type": "text",
+                            "norms": False,
+                            "similarity": "BM25",
+                            "index_options": "positions",
                         },
                     }
                 },
-            "highlight": {
-                "fields": {
-                    "text": {
-                        "type": "unified",
-                        "max_analyzed_offset": 1000000 - 1,
-                        },
-                    },
-                },
-            }
-    res = es.search(index=index_name, body=query)
 
-    return res
+            },
+            ignore=400,
+        )
 
+    def result_to_list(self, res):
+        l = []
+        for hit in res['hits']['hits']:
+            l.append(hit["_source"])
 
-def print_hits(res):
-    print("Got %d Hits:" % res['hits']['total']['value'])
-    for hit in res['hits']['hits']:
-        print(f'{hit["_source"]}')
-
-def truncate_error(e):
-    return str(e)[:1000]
-
+        return l
 
 if __name__ == '__main__':
     logfile = f"logs/indexer_{datetime.utcnow().timestamp()}.log"
@@ -545,20 +397,13 @@ if __name__ == '__main__':
 
     logger.addFilter(ElasticLogFilter())
 
+    es_helper = None
     if not dryrun:
-        es = Elasticsearch(hosts, timeout=30)
+        es_helper = ElasticHelper(hosts, index_name, logger, overwrite_index=overwrite_index)
 
-    if not dryrun:
-        if overwrite_index:
-            logger.info(f"overwriting old index: {index_name}")
-            es.indices.delete(index=index_name, ignore=[400, 404])
-
-        if not es.indices.exists(index=index_name):
-            logger.info(f"creating new index: {index_name}")
-            create_index(es, index_name)
 
     for id_, filepath in enumerate(filelist):
         chunker = Chunker(pretokenizer_type, chunksize)
-        ingester = Ingester(filepath, chunker, dryrun, es, index_name, tmpdir, logger, id_)
-        ingester.ingest()
-        es.indices.refresh()
+        ingester = Ingester(filepath, chunker, dryrun, es_helper, index_name, tmpdir, logger, id_)
+        ingester.ingest(es_helper)
+        es_helper.refresh()

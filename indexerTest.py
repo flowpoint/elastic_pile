@@ -6,7 +6,7 @@ from more_itertools import flatten
 from lm_dataformat import Reader, Archive
 
 from string import printable, whitespace
-from indexer import Chunker, Ingester, search_phrase, create_index
+from indexer import Chunker, Ingester, ElasticHelper
 import random
 
 from elasticsearch import Elasticsearch
@@ -71,13 +71,14 @@ class ChunkerTestCase(unittest.TestCase):
         
         self.randomstr = "".join(random.choices(chars, k=10000))
 
-        self.es = Elasticsearch(["localhost"])
+        hosts = ["localhost"]
+        self.es_helper = ElasticHelper(hosts, self.index_name, self.logger, overwrite_index=False)
 
-        create_index(self.es, self.index_name)
+        self.es_helper._create_index()
 
 
     def tearDown(self):
-        self.es.indices.delete(index=self.index_name, ignore=[400, 404])
+        self.es_helper.es.indices.delete(index=self.index_name, ignore=[400, 404])
 
     def test_chunker_consistency(self):
         doc = str(self.docs[0])
@@ -127,19 +128,19 @@ class ChunkerTestCase(unittest.TestCase):
     def test_ingester_dryrun(self):
         id_ = 0
         
-        ingester = Ingester(self.path, self.chunker, dryrun=True, es=None, index_name=self.index_name, tmpdir=self.tmpdir, id_=id_, logger=self.logger)
+        ingester = Ingester(self.path, self.chunker, dryrun=True, es_helper=None, index_name=self.index_name, tmpdir=self.tmpdir, id_=id_, logger=self.logger)
 
-        ingester.ingest()
+        ingester.ingest(self.es_helper)
 
     def test_ingester_ingest(self):
         id_ = 0
         
-        ingester = Ingester(self.path, self.chunker, dryrun=False, es=self.es, index_name=self.index_name, tmpdir=self.tmpdir, id_=id_, logger=self.logger)
+        ingester = Ingester(self.path, self.chunker, dryrun=False, es_helper=self.es_helper, index_name=self.index_name, tmpdir=self.tmpdir, id_=id_, logger=self.logger)
 
-        ingester.ingest()
-        self.es.indices.refresh()
+        ingester.ingest(self.es_helper)
+        self.es_helper.refresh()
 
-        res = search_phrase(self.es, self.index_name, "hello", "world")
+        res = self.es_helper.search_phrase("hello", "world")
         hit = res["hits"]["hits"][0]["_source"]["text"]
 
         self.assertEqual(
