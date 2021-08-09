@@ -276,14 +276,18 @@ class ElasticHelper:
         self.bulk_request_size = bulk_request_size
 
         if self.overwrite_index:
-            self.logger.info(f"overwriting old index: {index_name}")
+            self.logger.warning(f"overwriting index is set to True")
+
+    def streaming_bulk(self, processed):
+        if self.overwrite_index:
+            self.logger.warning(f"overwriting index is set to True")
+            self.logger.warning(f"overwriting old index: {index_name}")
             self.es.indices.delete(index=index_name, ignore=[400, 404])
 
         if not self.es.indices.exists(index=index_name):
             self.logger.info(f"creating new index: {index_name}")
             self._create_index()
 
-    def streaming_bulk(self, processed):
         return streaming_bulk(self.es, processed, chunk_size=self.bulk_request_size)
 
     def refresh(self):
@@ -329,7 +333,7 @@ class ElasticHelper:
                     "properties": {
                         "text": {
                             "type": "text",
-                            "norms": False,
+                            "norms": True,
                             "similarity": "BM25",
                             "index_options": "positions",
                         },
