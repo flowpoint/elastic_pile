@@ -1,15 +1,13 @@
 #!/bin/python
 import os
 import sys
-import json
 import logging
 from time import time
 from datetime import datetime
-from itertools import accumulate, chain, starmap, cycle
-from functools import reduce
-from multiprocessing import pool, Pool, Queue
-from typing import List, Tuple, Dict, Generator, Iterator, Sequence
+from itertools import chain
 import subprocess
+from multiprocessing import pool, Pool, Queue
+from typing import List, Tuple, Dict, Generator, Iterator, Sequence, Optional
 
 from more_itertools import chunked, flatten, sliced
 from tqdm import tqdm # type: ignore
@@ -23,7 +21,7 @@ from lm_dataformat import Reader # type: ignore
 
 
 class WhitespaceSplitter:
-    def __init__(self, 
+    def __init__(self,
             sus_document_behaviour="split_to_chunks",
             expected_word_len=8, 
             sus_len_factor=8, 
@@ -36,7 +34,7 @@ class WhitespaceSplitter:
         self.chunksize = chunksize
 
 
-    def pre_tokenize_str(self, x: str) -> tuple[Sequence[tuple[str, int]], bool]:
+    def pre_tokenize_str(self, x: str) -> tuple[Iterator[Sequence[str]], bool]:
         sus = False
         splits = x.split(" ")
         # if the splits are suspiciously small, it wasn't split well, 
@@ -45,13 +43,13 @@ class WhitespaceSplitter:
         if len(splits) * self.sus_word_len < len(x):
             sus = True
             if self.sus_document_behaviour == "split_to_words":
-                words = list(sliced(x, self.expected_word_len))
+                words = sliced(x, self.expected_word_len)
             elif self.sus_document_behaviour == "drop":
-                words = [""]
+                words = iter([""])
             else:
-                words = list(sliced(x, self.chunksize))
+                words = sliced(x, self.chunksize)
         else:
-            words = splits
+            words = iter(splits)
 
         # return -1 as word positions for this pre_tokenizer
         # and if document is sus
@@ -88,7 +86,7 @@ class Chunker:
     def _norm(self, x: str) -> str:
         return self.normalizer.normalize_str(x)
 
-    def _encode(self, x: str) -> list[str]:
+    def _encode(self, x: str) -> tuple[str, bool]:
         # pretok also returns positions, so we remove them
         words, sus = self.pretok.pre_tokenize_str(x)
         return words, sus
@@ -101,7 +99,9 @@ class Chunker:
         if not isinstance(document, str):
             raise ValueError(f"document has to be str but was: {type(document)}")
         else:
-            parts, sus = self._encode(self._norm(document))
+            p, sus = self._encode(self._norm(document))
+            parts = list(p)
+
 
         # important that some of these maps are evaluated or they spam your memory
         chunks = list(map(self._decode, chunked(parts, self.chunksize)))
@@ -111,150 +111,6 @@ class Chunker:
             logger.warning(f"document {self.document_pos}, equal to chunk: {self.chunk_pos} was badly chunked, alternative chunking was used")
 
         return chunks
-
-
-class Ingester:
-    def __init__(self,
-            filepath,
-            chunker,
-            dryrun,
-            es_helper,
-            index_name,
-            tmpdir,
-            logger,
-            id_,
-            paralellism=-1,
-            run_compressed=True):
-
-        self.errorlimit = 1000
-        self.errors = 0
-
-        self.index_name = index_name
-        self.es = es_helper
-
-        self.filepath = filepath
-        _, filename = os.path.split(self.filepath)
-        self.run_compressed = run_compressed
-
-        self.document_pos = 0
-        self.chunk_pos = 0
-
-        self.chunker = chunker
-
-        self.logger = logger
-        self.paralellism = paralellism
-        self.tmpdir = tmpdir
-        self.dryrun = dryrun
-
-        self.id_ = id_
-
-        self.bulk_request_size = 5000
-
-
-    def _strip_fileext(self, filepath, ext):
-        return filepath[::-1].replace(ext[::-1], "", 1)[::-1]
-
-    def _create_action(self, src: str, id_: int, index_name: str):
-        return { "_op_type": "create",
-                 "_index": index_name,
-                 "_id": id_,
-                 #"_source": {"text": src},
-                 "text": src,
-               }
-
-    def check_health(self):
-        if self.errorlimit < self.errors:
-            self.logger.error(f"too many errors: {self.errors}, quitting")
-            sys.exit(1)
-
-    def _reader(self):
-        if self.run_compressed:
-            self.logger.info(f"running on compressed data")
-            reader = Reader(self.filepath)
-            for doc in reader.stream_data():
-                self.check_health()
-                self.document_pos += 1
-                yield doc
-        else:
-            self.logger.info(f"running on decompressed data")
-            decompressed_filename = self._strip_fileext(filename, ".zst")
-            decompressed_path = os.path.join(self.tmpdir, decompressed_filename)
-
-            if not os.path.isfile(decompressed_path):
-                self.logger.info(f"decompressing: {self.filepath}")
-                subprocess.run(["zstd", "-d", self.filepath, "-o", decompressed_path])
-            else:
-                self.logger.info(f"found and use decompressed file: {decompressed_path}")
-
-            with jsonlines.open(decompressed_path) as reader:
-                for doc in reader.iter():
-                    self.check_health()
-                    yield doc
-
-    def _action_loader(self, chunks):
-        for pos, chunk in enumerate(chunks):
-            if not isinstance(chunk, str):
-                self.errors += 1
-                raise ValueError(f"chunk has to be a string but was: {type(chunk)}")
-            # assume there are maximum 100 Fileloaders/ dataset shards
-            yield self._create_action(chunk, pos * 100 + self.id_, self.index_name)
-
-
-    def ingest(self, es_helper):
-        starttime = time()
-        lastlog = starttime
-
-        self.logger.info(f"started Fileloader load_file {self.filepath}")
-
-        reader = self._reader()
-
-        with Pool(processes=max(self.paralellism, 1)) as pool:
-            if self.paralellism > 0:
-                chunklist = pool.imap_unordered(self.chunker.chunk_document, reader)
-                processed = self._action_loader(flatten(chunklist))
-
-            elif self.paralellism == -1:
-                chunklist = map(self.chunker.chunk_document, reader)
-                processed = self._action_loader(flatten(chunklist))
-            else:
-                self.errors += 1
-                raise ValueError(f"invalid paralellism: {paralellism}")
-
-            if self.dryrun:
-                for action in tqdm(processed):
-                    self.chunk_pos += 1
-                    pass
-                return
-
-            try:
-                for ok, info in tqdm(es_helper.streaming_bulk(processed), unit="chunk"):
-                    self.chunk_pos += 1
-                    try:
-                        if time() - lastlog > 60:
-                            self.logger.info(f"processed {self.chunk_pos} chunks")
-                            lastlog = time()
-
-                        if not ok:
-                            self.errors += 1
-                            raise Exception(info)
-
-                    except Exception as e:
-                        self.errors += 1
-                        self.logger.error(f"error in streaming_bulk:\n{truncate_error(e)}")
-            except Exception as e:
-                self.errors+=1
-                self.logger.error(f"error in streaming_bulk:\n{truncate_error(e)}")
-
-        self.logger.info(f"finished loading file {self.filepath}, id: {self.id_} with error count: {self.errors}, document count: {self.document_pos} and chunk count: {self.chunk_pos}")
-
-
-def truncate_error(e):
-    return str(e)[:1000]
-
-
-class ElasticLogFilter(logging.Filter):
-    def filter(self, record):
-        return not record.name.startswith("elasticsearch")
 
 
 class ElasticHelper:
@@ -278,14 +134,14 @@ class ElasticHelper:
         if self.overwrite_index:
             self.logger.warning(f"overwriting index is set to True")
 
-    def streaming_bulk(self, processed):
+    def streaming_bulk(self, processed: Iterator[dict]):
         if self.overwrite_index:
             self.logger.warning(f"overwriting index is set to True")
-            self.logger.warning(f"overwriting old index: {index_name}")
-            self.es.indices.delete(index=index_name, ignore=[400, 404])
+            self.logger.warning(f"overwriting old index: {self.index_name}")
+            self.es.indices.delete(index=self.index_name, ignore=[400, 404])
 
-        if not self.es.indices.exists(index=index_name):
-            self.logger.info(f"creating new index: {index_name}")
+        if not self.es.indices.exists(index=self.index_name):
+            self.logger.info(f"creating new index: {self.index_name}")
             self._create_index()
 
         return streaming_bulk(self.es, processed, chunk_size=self.bulk_request_size)
@@ -351,6 +207,154 @@ class ElasticHelper:
 
         return l
 
+
+class Ingester:
+    def __init__(self,
+            filepath,
+            chunker,
+            dryrun,
+            es_helper,
+            index_name,
+            tmpdir,
+            logger,
+            id_,
+            paralellism=-1,
+            run_compressed=True):
+
+        self.errorlimit = 1000
+        self.errors = 0
+
+        self.index_name = index_name
+        self.es = es_helper
+
+        self.filepath = filepath
+        self.run_compressed = run_compressed
+
+        self.document_pos = 0
+        self.chunk_pos = 0
+
+        self.chunker = chunker
+
+        self.logger = logger
+        self.paralellism = paralellism
+        self.tmpdir = tmpdir
+        self.dryrun = dryrun
+
+        self.id_ = id_
+
+        self.bulk_request_size = 5000
+
+
+    def _strip_fileext(self, filepath: str, ext: str) -> str:
+        return filepath[::-1].replace(ext[::-1], "", 1)[::-1]
+
+    def _create_action(self, src: str, id_: int, index_name: str) -> dict:
+        return { "_op_type": "create",
+                 "_index": index_name,
+                 "_id": id_,
+                 #"_source": {"text": src},
+                 "text": src,
+               }
+
+    def check_health(self):
+        if self.errorlimit < self.errors:
+            self.logger.error(f"too many errors: {self.errors}, quitting")
+            sys.exit(1)
+
+    def _reader(self) -> Iterator[str]:
+        if self.run_compressed:
+            self.logger.info(f"running on compressed data")
+            reader = Reader(self.filepath)
+            for doc in reader.stream_data():
+                self.check_health()
+                self.document_pos += 1
+                yield doc
+        else:
+            _, filename = os.path.split(self.filepath)
+
+            self.logger.info(f"running on decompressed data")
+            decompressed_filename = self._strip_fileext(filename, ".zst")
+            decompressed_path = os.path.join(self.tmpdir, decompressed_filename)
+
+            if not os.path.isfile(decompressed_path):
+                self.logger.info(f"decompressing: {self.filepath}")
+                subprocess.run(["zstd", "-d", self.filepath, "-o", decompressed_path])
+            else:
+                self.logger.info(f"found and use decompressed file: {decompressed_path}")
+
+            with jsonlines.open(decompressed_path) as reader:
+                for doc in reader.iter():
+                    self.check_health()
+                    yield doc
+
+    def _action_loader(self, chunks: Iterator[str]) -> Iterator[dict]:
+        for pos, chunk in enumerate(chunks):
+            if not isinstance(chunk, str):
+                self.errors += 1
+                raise ValueError(f"chunk has to be a string but was: {type(chunk)}")
+            # assume there are maximum 100 Fileloaders/ dataset shards
+            yield self._create_action(chunk, pos * 100 + self.id_, self.index_name)
+
+
+    def ingest(self, es_helper: Optional[ElasticHelper]):
+        if es_helper is None and self.dryrun == False:
+            raise ValueError(f"es_helper has to be set when indexing")
+
+        starttime = time()
+        lastlog = starttime
+
+        self.logger.info(f"started Fileloader load_file {self.filepath}")
+
+        reader = self._reader()
+
+        with Pool(processes=max(self.paralellism, 1)) as pool:
+            if self.paralellism > 0:
+                chunklist = pool.imap_unordered(self.chunker.chunk_document, reader) # type: ignore
+                processed = self._action_loader(flatten(chunklist))
+
+            elif self.paralellism == -1:
+                chunklist = map(self.chunker.chunk_document, reader) # type: ignore
+                processed = self._action_loader(flatten(chunklist))
+            else:
+                self.errors += 1
+                raise ValueError(f"invalid paralellism: {paralellism}")
+
+            if self.dryrun:
+                for action in tqdm(processed):
+                    self.chunk_pos += 1
+                    pass
+
+            else:
+                try:
+                    for ok, info in tqdm(es_helper.streaming_bulk(processed), unit="chunk"): # type: ignore
+                        self.chunk_pos += 1
+                        try:
+                            if time() - lastlog > 60:
+                                self.logger.info(f"processed {self.chunk_pos} chunks")
+                                lastlog = time()
+
+                            if not ok:
+                                self.errors += 1
+                                raise Exception(info)
+
+                        except Exception as e:
+                            self.errors += 1
+                            self.logger.error(f"error in streaming_bulk:\n{truncate_error(e)}")
+                except Exception as e:
+                    self.errors+=1
+                    self.logger.error(f"error in streaming_bulk:\n{truncate_error(e)}")
+
+        self.logger.info(f"finished loading file {self.filepath}, id: {self.id_} with error count: {self.errors}, document count: {self.document_pos} and chunk count: {self.chunk_pos}")
+
+
+def truncate_error(e):
+    return str(e)[:1000]
+
+
+class ElasticLogFilter(logging.Filter):
+    def filter(self, record):
+        return not record.name.startswith("elasticsearch")
+
 if __name__ == '__main__':
     logfile = f"logs/indexer_{datetime.utcnow().timestamp()}.log"
     if os.path.isfile(logfile):
@@ -410,4 +414,5 @@ if __name__ == '__main__':
         chunker = Chunker(pretokenizer_type, chunksize)
         ingester = Ingester(filepath, chunker, dryrun, es_helper, index_name, tmpdir, logger, id_)
         ingester.ingest(es_helper)
-        es_helper.refresh()
+        if es_helper is not None:
+            es_helper.refresh()
