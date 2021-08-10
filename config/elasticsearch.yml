@@ -9,4 +9,4 @@ xpack.watcher.enabled: false
 
 indices.memory.index_buffer_size: 512MB
 node.roles: [ master, ingest, data_hot, data ]
-
+xpack.security.enabled: true

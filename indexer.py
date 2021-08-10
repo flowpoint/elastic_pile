@@ -378,12 +378,15 @@ if __name__ == '__main__':
 
     # the order of files is important, because we enumerate the id across files
     #filelist = sorted(["pile/val.jsonl.zst"])
-    filelist = sorted(["../00.jsonl.zst"])
+    #filelist = sorted(["../00.jsonl.zst"])
+    pilepath = "./pile/the-eye.eu/public/AI/pile/train/"
+    filelist = sorted(os.listdir(pilepath))
+
     for f in filelist:
         if not os.path.isfile(f):
             raise FileNotFoundError(f)
 
-    index_name = "test_index"
+    index_name = "pile_index"
 
     # size in words according to pre_tokenizer
     chunksize = 256

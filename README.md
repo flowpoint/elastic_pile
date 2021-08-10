@@ -65,3 +65,5 @@ either use a db (like BlazeGraph)
 or run naively through rdf-files
 
 i hope this can be of use to anyone
+
+if selinux causes permission errors try smth. like `chcon -R -t container_file_t config/elasticsearch.yml`
