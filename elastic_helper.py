@@ -6,22 +6,14 @@ from logging import getLogger, StreamHandler, DEBUG
 import re
 import json
 
-from time import time
-from datetime import datetime
 from itertools import chain, cycle, takewhile
-import subprocess
 from multiprocessing import pool, Pool, Queue
 from typing import List, Tuple, Dict, Generator, Iterator, Sequence, Optional
-from timeit import timeit
-
-from more_itertools import chunked, flatten, sliced
-from tqdm import tqdm # type: ignore
 
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import bulk, streaming_bulk, parallel_bulk
-from elasticsearch_dsl import Search, Q
-
-from tokenizers import pre_tokenizers, decoders, normalizers # type: ignore
+from elasticsearch_dsl import Search, Q, MultiSearch 
+from elasticsearch_dsl.query import Match, MatchPhrase
 
 patt = re.compile("[A-Z]?[a-z]*")
 
@@ -35,9 +27,6 @@ class ElasticHelper:
             overwrite_index=False,
             timeout=30,
             ):
-        '''usage:
-
-        '''
 
         self.hosts = hosts
         self.es = Elasticsearch(self.hosts, timeout=timeout)
@@ -78,8 +67,8 @@ class ElasticHelper:
         s = self._search(**kwargs)
 
         q = Q('match', text=word)
-        response = s.query(q).execute()
-        return response
+        search = s.query(q)
+        return search
 
     def search_triple(self, entityA: str, relation: str, entityB: str, **kwargs):
         s = self._search(**kwargs)
@@ -90,45 +79,25 @@ class ElasticHelper:
         q1 = (qA & qB)
         q = q1 | (q1 & qR)
 
-        response = s.query(q).execute()
-        return response
+        search = s.query(q)
+        return search
 
     def search_doc_not_entityB(self, doc: str, entityB, **kwargs):
         s = self._search(**kwargs)
 
-        q1 = Q('match', text=doc, cutoff_frequncy=10000)
+        q1 = Q('match', text=doc, cutoff_frequency=10000)
         q2 = ~Q('match', text=entityB)
         q = q1 & q2
 
         response = s.query(q).execute()
         return response
 
-    def search_phrase(self, entityA: str, entityB: str, num_results: int = 10, max_slop: int = 20):
-        query = {
-                "size": num_results,
-                "query": {
-                    "bool": {
-                        "must": {
-                            "match_phrase": {
-                                "text": {
-                                    "query": f"{entityA} {entityB}",
-                                    "slop": max_slop,
-                                    },
-                                },
-                            },
-                        }
-                    },
-                "highlight": {
-                    "fields": {
-                        "text": {
-                            "type": "unified",
-                            "max_analyzed_offset": 1000000 - 1,
-                            },
-                        },
-                    },
-                }
-        res = self.es.search(index=self.index_name, body=query)
-        return res
+    def multi_search(self, searches):
+        ms = MultiSearch(using=self.es, index=self.index_name)
+        for s in searches:
+            ms = ms.add(s)
+
+        return ms.execute(raise_on_error=True)
 
     def _create_index(self):
         self.es.indices.create(
