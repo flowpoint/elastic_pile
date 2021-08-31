@@ -16,9 +16,10 @@ docker run \
     -p 9300:9300 \
     --name es00-pile \
     --net elastic \
-    -e ES_JAVA_OPTS="-Xms12g -Xmx12g" \
+    -e ELASTIC_PASSWORD=$ELASTIC_PASSWORD \
+    -e ES_JAVA_OPTS="-Xms10g -Xmx10g" \
     -e "discovery.type=single-node" \
-    --mount type=bind,source=$pilekg_datadir,target=/usr/share/elasticsearch/data:z,bind-propagation=shared \
-    --mount type=bind,source=$pilekg_configdir/elasticsearch.yml,target=/usr/share/elasticsearch/config/elasticsearch.yml:z,bind-propagation=shared \
+    -v $pilekg_datadir:/usr/share/elasticsearch/data:z \
+    -v $pilekg_configdir/elasticsearch.yml:/usr/share/elasticsearch/config/elasticsearch.yml:z \
     docker.elastic.co/elasticsearch/elasticsearch:7.13.4 
 

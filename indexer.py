@@ -19,6 +19,8 @@ from tokenizers import pre_tokenizers, decoders, normalizers # type: ignore
 import jsonlines # type: ignore
 from lm_dataformat import Reader # type: ignore
 
+from elastic_helper import ElasticHelper
+
 
 class WhitespaceSplitter:
     def __init__(self,
@@ -369,18 +371,18 @@ if __name__ == '__main__':
 
     bulk_request_size = 5000
 
-    hosts = ["localhost"]
+    hosts = [f'http://elastic:{os.environ.get("ELASTIC_PASSWORD")}@localhost:9200']
     tmpdir = "tmp"
 
     overwrite_index = False
-    run_compressed = False
+    #run_compressed = False
     break_on_error = True
 
     # the order of files is important, because we enumerate the id across files
     #filelist = sorted(["pile/val.jsonl.zst"])
     #filelist = sorted(["../00.jsonl.zst"])
     pilepath = "./pile/the-eye.eu/public/AI/pile/train/"
-    filelist = sorted(os.listdir(pilepath))
+    filelist = list(map(lambda x: os.path.join(pilepath, x), sorted(os.listdir(pilepath))))
 
     for f in filelist:
         if not os.path.isfile(f):

@@ -15,6 +15,8 @@ from time import sleep
 
 import json
 
+from elastic_helper import ElasticHelper
+
 class DummyLogger:
     def info(self, s):
         pass

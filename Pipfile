@@ -19,6 +19,7 @@ mypy = "*"
 build = "*"
 wheel = "*"
 lm-dataformat = {file = "https://github.com/flowpoint/lm_dataformat/releases/download/0.0.19/lm_dataformat-0.0.19-py3-none-any.whl"}
+elasticsearch-dsl = "*"
 
 [dev-packages]
 
